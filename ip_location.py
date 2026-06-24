@@ -190,6 +190,25 @@ def get_network_bytes():
         return 0, 0
 
 
+import re
+
+
+def ping_host(ip: str, timeout_ms: int = 1000):
+    """Ping the host once. Returns (success: bool, rtt_ms: float|None)."""
+    try:
+        out = subprocess.run(
+            ["ping", "-c", "1", "-W", str(timeout_ms), ip],
+            capture_output=True, text=True, timeout=timeout_ms / 1000.0 + 3,
+        )
+        if out.returncode == 0:
+            m = re.search(r"time[=<]\s*([\d.]+)", out.stdout)
+            rtt = float(m.group(1)) if m else None
+            return True, rtt
+        return False, None
+    except Exception:
+        return False, None
+
+
 def format_speed(bytes_per_sec: float) -> str:
     """Format bytes/sec into human readable string."""
     if bytes_per_sec < 1024:
@@ -341,6 +360,48 @@ class CircleBubbleView(NSView):
             self._app.quit_app(None)
 
 
+class BreathingDotView(NSView):
+    """A small circular dot with a continuous breathing (pulsing) animation.
+    Green when the keep-alive target is reachable, red when unreachable."""
+
+    def initWithFrame_(self, frame):
+        self = objc.super(BreathingDotView, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self.setWantsLayer_(True)
+        layer = self.layer()
+        layer.setCornerRadius_(frame.size.width / 2.0)
+        layer.setBorderWidth_(0.6)
+        layer.setBorderColor_(
+            NSColor.colorWithCalibratedRed_green_blue_alpha_(1, 1, 1, 0.85).CGColor())
+        self._set_rgb(0.30, 0.82, 0.45)  # green default
+        self._start_breathing()
+        return self
+
+    def _set_rgb(self, r, g, b):
+        c = NSColor.colorWithCalibratedRed_green_blue_alpha_(r, g, b, 1.0)
+        self.layer().setBackgroundColor_(c.CGColor())
+
+    def setOK_(self, ok):
+        if ok:
+            self._set_rgb(0.30, 0.82, 0.45)   # green
+        else:
+            self._set_rgb(0.93, 0.30, 0.30)   # red
+
+    def _start_breathing(self):
+        try:
+            from Quartz import CABasicAnimation
+        except Exception:
+            return
+        anim = CABasicAnimation.animationWithKeyPath_("opacity")
+        anim.setFromValue_(1.0)
+        anim.setToValue_(0.25)
+        anim.setDuration_(1.1)
+        anim.setAutoreverses_(True)
+        anim.setRepeatCount_(float("inf"))
+        self.layer().addAnimation_forKey_(anim, "breath")
+
+
 def _make_label(frame, text, size, color=None, weight=None, alpha=1.0):
     label = NSTextField.alloc().initWithFrame_(frame)
     label.setStringValue_(text)
@@ -480,9 +541,17 @@ def create_bubble_window():
     down_label.setShadow_(text_shadow)
     content.addSubview_(down_label)
 
+    # Keep-alive breathing dot, centered directly above the country code.
+    # cc_label sits at y=38 h=26 (text top ~64); place the dot just above it.
+    dot_size = 9
+    dot_view = BreathingDotView.alloc().initWithFrame_(
+        NSMakeRect((size - dot_size) / 2.0, 63, dot_size, dot_size))
+    dot_view.setHidden_(True)  # only shown when keep-alive is enabled
+    content.addSubview_(dot_view)
+
     window.orderFrontRegardless()
 
-    return window, flag_label, cc_label, up_label, down_label
+    return window, flag_label, cc_label, up_label, down_label, dot_view
 
 
 # --- Main App ---
@@ -507,9 +576,18 @@ class IPLocationApp(rumps.App):
         config = load_config()
         self.interval = config.get("interval_seconds", 30)
 
+        # Keep-alive state
+        self.keepalive_enabled = config.get("keepalive_enabled", False)
+        self.keepalive_ip = config.get("keepalive_ip", "10.54.21.122")
+        self.keepalive_interval = config.get("keepalive_interval_seconds", 15)
+        self.keepalive_status = False
+        self.keepalive_rtt = None
+
         # Create bubble
         (self.bubble_window, self.bubble_flag, self.bubble_cc,
-         self.bubble_up, self.bubble_down) = create_bubble_window()
+         self.bubble_up, self.bubble_down, self.bubble_dot) = create_bubble_window()
+        if self.keepalive_enabled:
+            self.bubble_dot.setHidden_(False)
         # Connect app reference for right-click menu
         self.bubble_window.contentView()._app = self
 
@@ -523,6 +601,14 @@ class IPLocationApp(rumps.App):
         autostart_title = "✓ Launch at Login" if is_autostart_enabled() else "Launch at Login"
         self.autostart_item = rumps.MenuItem(autostart_title, callback=self.toggle_autostart)
 
+        # Keep-alive menu items
+        ka_status = "Keep Alive: On" if self.keepalive_enabled else "Keep Alive: Off"
+        self.keepalive_status_item = rumps.MenuItem(ka_status)
+        self.keepalive_ip_item = rumps.MenuItem(f"KA Target: {self.keepalive_ip}")
+        self.keepalive_interval_item = rumps.MenuItem(f"KA Interval: {self.keepalive_interval}s")
+        ka_toggle_title = "Disable Keep Alive" if self.keepalive_enabled else "Enable Keep Alive"
+        self.keepalive_toggle = rumps.MenuItem(ka_toggle_title, callback=self.toggle_keepalive)
+
         self.menu = [
             self.ip_item,
             self.country_item,
@@ -532,6 +618,13 @@ class IPLocationApp(rumps.App):
             self.interval_item,
             rumps.MenuItem("Set Interval...", callback=self.set_interval),
             rumps.MenuItem("Refresh Now", callback=self.refresh_now),
+            None,
+            self.keepalive_status_item,
+            self.keepalive_ip_item,
+            self.keepalive_interval_item,
+            self.keepalive_toggle,
+            rumps.MenuItem("Set Keep Alive IP...", callback=self.set_keepalive_ip),
+            rumps.MenuItem("Set Keep Alive Interval...", callback=self.set_keepalive_interval),
             None,
             self.bubble_toggle,
             self.autostart_item,
@@ -545,6 +638,7 @@ class IPLocationApp(rumps.App):
 
         self._start_timer()
         self._start_speed_timer()
+        self._start_keepalive_timer()
 
     def _start_timer(self):
         self._stop_event = threading.Event()
@@ -584,6 +678,44 @@ class IPLocationApp(rumps.App):
             self.speed_item.title = f"Speed: ↑ {up_str}  ↓ {down_str}"
 
         run_on_main_thread(_apply)
+
+    def _start_keepalive_timer(self):
+        """Run the keep-alive ping loop in a background thread."""
+        self._ka_stop = threading.Event()
+        self._ka_thread = threading.Thread(target=self._keepalive_loop, daemon=True)
+        self._ka_thread.start()
+
+    def _keepalive_loop(self):
+        while not self._ka_stop.is_set():
+            if self.keepalive_enabled:
+                ok, rtt = ping_host(self.keepalive_ip)
+                self.keepalive_status = ok
+                self.keepalive_rtt = rtt
+                self._update_keepalive_ui()
+                self._ka_stop.wait(self.keepalive_interval)
+            else:
+                self._ka_stop.wait(1)
+
+    def _update_keepalive_ui(self):
+        ok = self.keepalive_status
+        rtt = self.keepalive_rtt
+        if ok and rtt is not None:
+            status_str = f"Keep Alive: ✓ {rtt:.0f}ms"
+        elif ok:
+            status_str = "Keep Alive: ✓"
+        else:
+            status_str = "Keep Alive: ✗ unreachable"
+
+        def _apply():
+            self.keepalive_status_item.title = status_str
+            self.bubble_dot.setOK_(ok)
+
+        run_on_main_thread(_apply)
+
+    def _restart_keepalive(self):
+        """Restart the ping loop so changes take effect immediately."""
+        self._ka_stop.set()
+        self._start_keepalive_timer()
 
     def _poll_loop(self):
         while not self._stop_event.is_set():
@@ -673,6 +805,74 @@ class IPLocationApp(rumps.App):
             except ValueError:
                 rumps.alert("Invalid input", "Please enter a number.")
 
+    def toggle_keepalive(self, sender):
+        self.keepalive_enabled = not self.keepalive_enabled
+        config = load_config()
+        config["keepalive_enabled"] = self.keepalive_enabled
+        save_config(config)
+
+        if self.keepalive_enabled:
+            sender.title = "Disable Keep Alive"
+
+            def _show():
+                self.bubble_dot.setHidden_(False)
+                self.keepalive_status_item.title = "Keep Alive: On"
+
+            run_on_main_thread(_show)
+            self._restart_keepalive()  # immediate ping
+        else:
+            sender.title = "Enable Keep Alive"
+            self.keepalive_status = False
+            self.keepalive_rtt = None
+
+            def _hide():
+                self.bubble_dot.setHidden_(True)
+                self.keepalive_status_item.title = "Keep Alive: Off"
+
+            run_on_main_thread(_hide)
+
+    def set_keepalive_ip(self, _):
+        window = rumps.Window(
+            message="Enter the internal IP / host to keep alive:",
+            title="Keep Alive IP",
+            default_text=self.keepalive_ip,
+            dimensions=(220, 24),
+        )
+        response = window.run()
+        if response.clicked:
+            ip = response.text.strip()
+            if ip:
+                self.keepalive_ip = ip
+                self.keepalive_ip_item.title = f"KA Target: {ip}"
+                config = load_config()
+                config["keepalive_ip"] = ip
+                save_config(config)
+                if self.keepalive_enabled:
+                    self._restart_keepalive()
+
+    def set_keepalive_interval(self, _):
+        window = rumps.Window(
+            message="Enter keep-alive ping interval in seconds:",
+            title="Keep Alive Interval",
+            default_text=str(self.keepalive_interval),
+            dimensions=(200, 24),
+        )
+        response = window.run()
+        if response.clicked:
+            try:
+                val = int(response.text.strip())
+                if val < 3:
+                    val = 3
+                self.keepalive_interval = val
+                self.keepalive_interval_item.title = f"KA Interval: {val}s"
+                config = load_config()
+                config["keepalive_interval_seconds"] = val
+                save_config(config)
+                if self.keepalive_enabled:
+                    self._restart_keepalive()
+            except ValueError:
+                rumps.alert("Invalid input", "Please enter a number.")
+
     def toggle_autostart(self, sender):
         if is_autostart_enabled():
             disable_autostart()
@@ -686,6 +886,7 @@ class IPLocationApp(rumps.App):
     def quit_app(self, _):
         self._stop_event.set()
         self._speed_stop.set()
+        self._ka_stop.set()
         self.bubble_window.orderOut_(None)
         rumps.quit_application()
 

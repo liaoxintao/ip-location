@@ -1,3 +1,8 @@
 {
-  "interval_seconds": 30
+  "interval_seconds": 30,
+  "bubble_x": 1354.0,
+  "bubble_y": 781.0,
+  "keepalive_enabled": true,
+  "keepalive_ip": "10.54.21.122",
+  "keepalive_interval_seconds": 15
 }
