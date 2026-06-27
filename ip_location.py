@@ -576,9 +576,16 @@ class IPLocationApp(rumps.App):
         config = load_config()
         self.interval = config.get("interval_seconds", 30)
 
-        # Keep-alive state
+        # Keep-alive state. Only one IP is active (pinged) at a time, but a
+        # history list is kept so switching targets doesn't lose old entries.
         self.keepalive_enabled = config.get("keepalive_enabled", False)
         self.keepalive_ip = config.get("keepalive_ip", "10.54.21.122")
+        self.keepalive_ips = list(config.get("keepalive_ips") or [])
+        if self.keepalive_ip and self.keepalive_ip not in self.keepalive_ips:
+            self.keepalive_ips.insert(0, self.keepalive_ip)
+        if not self.keepalive_ips:
+            self.keepalive_ips = ["10.54.21.122"]
+            self.keepalive_ip = "10.54.21.122"
         self.keepalive_interval = config.get("keepalive_interval_seconds", 15)
         self.keepalive_status = False
         self.keepalive_rtt = None
@@ -604,7 +611,9 @@ class IPLocationApp(rumps.App):
         # Keep-alive menu items
         ka_status = "Keep Alive: On" if self.keepalive_enabled else "Keep Alive: Off"
         self.keepalive_status_item = rumps.MenuItem(ka_status)
-        self.keepalive_ip_item = rumps.MenuItem(f"KA Target: {self.keepalive_ip}")
+        # Submenu listing all stored IPs (history); the active one is checkmarked.
+        self.keepalive_target_menu = rumps.MenuItem("KA Target")
+        self._rebuild_target_menu()
         self.keepalive_interval_item = rumps.MenuItem(f"KA Interval: {self.keepalive_interval}s")
         ka_toggle_title = "Disable Keep Alive" if self.keepalive_enabled else "Enable Keep Alive"
         self.keepalive_toggle = rumps.MenuItem(ka_toggle_title, callback=self.toggle_keepalive)
@@ -620,10 +629,9 @@ class IPLocationApp(rumps.App):
             rumps.MenuItem("Refresh Now", callback=self.refresh_now),
             None,
             self.keepalive_status_item,
-            self.keepalive_ip_item,
+            self.keepalive_target_menu,
             self.keepalive_interval_item,
             self.keepalive_toggle,
-            rumps.MenuItem("Set Keep Alive IP...", callback=self.set_keepalive_ip),
             rumps.MenuItem("Set Keep Alive Interval...", callback=self.set_keepalive_interval),
             None,
             self.bubble_toggle,
@@ -831,24 +839,64 @@ class IPLocationApp(rumps.App):
 
             run_on_main_thread(_hide)
 
-    def set_keepalive_ip(self, _):
+    def _rebuild_target_menu(self):
+        """Repopulate the KA Target submenu from the stored IP list,
+        checkmarking the currently active one."""
+        self.keepalive_target_menu.title = f"KA Target: {self.keepalive_ip}"
+        if len(self.keepalive_target_menu):  # submenu NSMenu is lazily created on first add
+            self.keepalive_target_menu.clear()
+        for ip in self.keepalive_ips:
+            item = rumps.MenuItem(ip, callback=self._select_keepalive_ip)
+            item.state = 1 if ip == self.keepalive_ip else 0
+            self.keepalive_target_menu.add(item)
+        self.keepalive_target_menu.add(rumps.separator)
+        self.keepalive_target_menu.add(
+            rumps.MenuItem("Add IP...", callback=self.add_keepalive_ip))
+        self.keepalive_target_menu.add(
+            rumps.MenuItem("Remove Current IP", callback=self.remove_keepalive_ip))
+
+    def _persist_keepalive_ips(self):
+        config = load_config()
+        config["keepalive_ip"] = self.keepalive_ip
+        config["keepalive_ips"] = self.keepalive_ips
+        save_config(config)
+
+    def _switch_keepalive_ip(self, ip):
+        """Make `ip` the active target and apply everywhere."""
+        self.keepalive_ip = ip
+        self.keepalive_status = False
+        self.keepalive_rtt = None
+        self._persist_keepalive_ips()
+        self._rebuild_target_menu()
+        if self.keepalive_enabled:
+            self._restart_keepalive()  # immediate ping of the new target
+
+    def _select_keepalive_ip(self, sender):
+        if sender.title != self.keepalive_ip:
+            self._switch_keepalive_ip(sender.title)
+
+    def add_keepalive_ip(self, _):
         window = rumps.Window(
-            message="Enter the internal IP / host to keep alive:",
-            title="Keep Alive IP",
-            default_text=self.keepalive_ip,
+            message="Enter an internal IP / host to keep alive:",
+            title="Add Keep Alive IP",
+            default_text="",
             dimensions=(220, 24),
         )
         response = window.run()
         if response.clicked:
             ip = response.text.strip()
             if ip:
-                self.keepalive_ip = ip
-                self.keepalive_ip_item.title = f"KA Target: {ip}"
-                config = load_config()
-                config["keepalive_ip"] = ip
-                save_config(config)
-                if self.keepalive_enabled:
-                    self._restart_keepalive()
+                if ip not in self.keepalive_ips:
+                    self.keepalive_ips.append(ip)
+                self._switch_keepalive_ip(ip)
+
+    def remove_keepalive_ip(self, _):
+        if len(self.keepalive_ips) <= 1:
+            rumps.alert("Keep Alive", "At least one IP must remain in the list.")
+            return
+        if self.keepalive_ip in self.keepalive_ips:
+            self.keepalive_ips.remove(self.keepalive_ip)
+        self._switch_keepalive_ip(self.keepalive_ips[0])
 
     def set_keepalive_interval(self, _):
         window = rumps.Window(
